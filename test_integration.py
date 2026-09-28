@@ -41,6 +41,9 @@ def client():
             except httpx.TransportError:
                 pass
             if time.monotonic() > deadline:
+                # In CI a skip would read as a pass, so a missing API fails.
+                if os.getenv("CI"):
+                    pytest.fail(f"Agent Relay is not ready at {BASE_URL}")
                 pytest.skip(f"Agent Relay is not ready at {BASE_URL}")
             time.sleep(1)
         yield http

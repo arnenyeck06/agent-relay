@@ -12,7 +12,7 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 # Install dependencies first so they're cached across code changes.
 COPY pyproject.toml uv.lock .python-version ./
-RUN uv sync --locked --no-install-project
+RUN uv sync --frozen --no-install-project
 
 COPY *.py dashboard.html ./
 

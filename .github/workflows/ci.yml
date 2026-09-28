@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Install exactly what uv.lock pins; never re-resolve it in CI.
+  UV_FROZEN: "1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      DB_HOSTPORT: localhost:55432
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: agent_relay
+        # A fixed port reachable on localhost from GitHub runners and from act
+        # (host network).  Not 5432, so it never hits a local Compose database.
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U relay -d agent_relay"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Create scratch test database
+        run: |
+          uv run python -c "
+          import psycopg
+          with psycopg.connect('postgresql://relay:relay@${DB_HOSTPORT}/agent_relay', autocommit=True) as c:
+              c.execute('CREATE DATABASE agent_relay_test')
+          "
+
+      - name: Starter tests
+        env:
+          RELAY_DATABASE_URL: postgresql+psycopg://relay:relay@${{ env.DB_HOSTPORT }}/agent_relay_test
+        run: uv run pytest -q test_agent_relay.py
+
+      - name: Start API
+        env:
+          RELAY_DATABASE_URL: postgresql+psycopg://relay:relay@${{ env.DB_HOSTPORT }}/agent_relay
+        # Not 8000: under act the job shares the host network with any local
+        # Compose API, and the tests must hit this job's server.
+        run: |
+          nohup uv run uvicorn main:app --host 127.0.0.1 --port 18000 > api.log 2>&1 &
+          pid=$!
+          for i in $(seq 1 30); do
+            kill -0 "$pid" 2>/dev/null || { cat api.log; exit 1; }
+            curl -sf http://127.0.0.1:18000/ready && exit 0
+            sleep 1
+          done
+          cat api.log; exit 1
+
+      - name: Integration test
+        env:
+          RELAY_BASE_URL: http://127.0.0.1:18000
+          RELAY_IT_DATABASE_URL: postgresql://relay:relay@${{ env.DB_HOSTPORT }}/agent_relay
+        run: uv run pytest -q test_integration.py
+
+      - name: API log
+        if: failure()
+        run: cat api.log || true
+
+  # Deploys to a local kind cluster, so it only runs where one is reachable:
+  # locally under act with `--var DEPLOY_TO_KIND=true` (see .actrc).  act runs
+  # this job on the host network with the host's Docker socket mounted, so it
+  # builds into the same Docker daemon kind uses and reaches the published
+  # kind API server on 127.0.0.1.
+  deploy:
+    needs: test
+    if: vars.DEPLOY_TO_KIND == 'true'
+    runs-on: ubuntu-latest
+    env:
+      KIND_CLUSTER: ${{ vars.KIND_CLUSTER || 'agent-relay' }}
+      NAMESPACE: agent-relay
+      KIND_VERSION: v0.33.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kind and kubectl
+        run: |
+          case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; esac
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSLo "$RUNNER_TEMP/bin/kind" "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-${arch}"
+          curl -fsSLo "$RUNNER_TEMP/bin/kubectl" \
+            "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${arch}/kubectl"
+          chmod +x "$RUNNER_TEMP/bin/kind" "$RUNNER_TEMP/bin/kubectl"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Connect to kind cluster
+        run: |
+          docker version --format 'Docker server {{.Server.Version}}'
+          kind get kubeconfig --name "$KIND_CLUSTER" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+          KUBECONFIG="$RUNNER_TEMP/kubeconfig" kubectl get nodes
+
+      - name: Build image
+        run: |
+          # Unique per run even when act runs an uncommitted tree at one SHA.
+          tag="$(echo "$GITHUB_SHA" | cut -c1-7)-$(date -u +%Y%m%d%H%M%S)"
+          echo "IMAGE=agent-relay:${tag}" >> "$GITHUB_ENV"
+          docker build -t "agent-relay:${tag}" .
+
+      - name: Load image into kind
+        run: kind load docker-image "$IMAGE" --name "$KIND_CLUSTER"
+
+      - name: Deploy
+        run: |
+          kubectl kustomize k8s/ | sed "s|image: agent-relay:local|image: ${IMAGE}|" | kubectl apply -f -
+          kubectl -n "$NAMESPACE" rollout status statefulset/postgres --timeout=180s
+          kubectl -n "$NAMESPACE" rollout status deployment/agent-relay --timeout=180s
+
+      - name: Verify deployment
+        run: |
+          deployed=$(kubectl -n "$NAMESPACE" get deployment agent-relay -o jsonpath='{.spec.template.spec.containers[0].image}')
+          test "$deployed" = "$IMAGE"
+          kubectl -n "$NAMESPACE" get pods -o wide
+          kubectl -n "$NAMESPACE" exec deploy/agent-relay -- \
+            python -c "import urllib.request as u; print(u.urlopen('http://127.0.0.1:8000/ready').read().decode())"
+          echo "Deployed $IMAGE"

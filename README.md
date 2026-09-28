@@ -102,3 +102,41 @@ scratch `agent_relay_test` database (created on first start by
 `docker/postgres-init/`) so they don't reset the app's `agent_relay` data. The
 fixture drops and recreates all tables on whatever `RELAY_DATABASE_URL` points
 at, so never point it at a database with data you need.
+
+## Deploy to Kubernetes (kind)
+
+`k8s/` holds the manifests: a `postgres` StatefulSet with a 1Gi
+PersistentVolumeClaim and `pg_isready` probes, and an `agent-relay` Deployment
+that waits for the database (init container) and uses `/ready` / `/health` as
+readiness / liveness probes. Both have ClusterIP Services in the `agent-relay`
+namespace.
+
+```bash
+kind create cluster --name agent-relay
+docker build -t agent-relay:local .
+kind load docker-image agent-relay:local --name agent-relay
+kubectl apply -k k8s/
+kubectl -n agent-relay get pods
+kubectl -n agent-relay port-forward svc/agent-relay 8080:8000
+```
+
+The dashboard is then at <http://127.0.0.1:8080/>. After rebuilding the image,
+`kind load` it again and run `kubectl -n agent-relay rollout restart deployment/agent-relay`.
+
+## CI/CD
+
+`.github/workflows/ci.yml` runs the starter tests and the integration test
+against a PostgreSQL service, then (only if they pass) builds the image with a
+unique tag (`<short-sha>-<UTC timestamp>`), loads it into kind, applies `k8s/`
+with that tag, and waits for the rollout. The deploy job only runs when the
+`DEPLOY_TO_KIND` variable is `true`, which `.actrc` sets for local runs:
+
+```bash
+brew install act
+act push
+```
+
+act runs jobs on the host network with the host Docker socket mounted, so the
+deploy job builds into the same daemon kind uses and reaches the kind API
+server on `127.0.0.1`. The CI database and API use ports 55432 and 18000 so
+they never collide with a running Compose stack.
